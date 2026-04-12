@@ -1,4 +1,4 @@
-name = "normsar-edge-broadcaster"
+name = "normsar-do"
 main = "src/index.ts"
 compatibility_date = "2026-04-12"
 
