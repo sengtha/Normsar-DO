@@ -1,0 +1,11 @@
+name = "normsar-edge-broadcaster"
+main = "src/index.ts"
+compatibility_date = "2026-04-12"
+
+[[durable_objects.bindings]]
+name = "CHAT_ROOM_DO"
+class_name = "ChatRoomDO"
+
+[[migrations]]
+tag = "v1"
+new_classes = ["ChatRoomDO"]
