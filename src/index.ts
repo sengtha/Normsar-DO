@@ -23,6 +23,15 @@ export class ChatRoomDO extends DurableObject {
 
   async fetch(request: Request) {
     if (request.method === "POST") {
+      // 1. Extract the key from the request header
+      const providedKey = request.headers.get("X-DO-Access-Key");
+      
+      // 2. Compare it to the environment secret
+      if (providedKey !== this.env.DO_SECRET_KEY) {
+        console.warn("Blocked unauthorized broadcast attempt");
+        return new Response("Unauthorized", { status: 401 });
+      }
+      
       const payload = await request.json();
       this.broadcastToAll(JSON.stringify(payload));
       return new Response("Broadcasted", { status: 200 });
