@@ -1,61 +1,88 @@
 import { DurableObject } from "cloudflare:workers";
+import { createRemoteJWKSet, jwtVerify, JWTPayload } from "jose";
 
 export interface Env {
   CHAT_ROOM_DO: DurableObjectNamespace;
   DO_SECRET_KEY: string;
-  SUPABASE_JWT_SECRET: string; // ⚡ ADD THIS to your Cloudflare Variables/Secrets
+
+  // Your Supabase project URL: https://<project-ref>.supabase.co
+  SUPABASE_URL: string;
+
+  // Use publishable key (or legacy anon key) for /auth/v1/user fallback checks
+  SUPABASE_PUBLISHABLE_KEY: string;
+
+  // Optional: legacy HS256 secret if you insist on local HS256 verify (not recommended)
+  // SUPABASE_JWT_SECRET?: string;
 }
 
-// Helper function to decode base64url safely
-function base64UrlDecode(str: string) {
-  str = str.replace(/-/g, '+').replace(/_/g, '/');
-  while (str.length % 4) {
-    str += '=';
-  }
-  return atob(str);
+type VerifiedToken = {
+  valid: boolean;
+  payload?: JWTPayload;
+  reason?: string;
+};
+
+function getBearerFromQuery(url: URL): string | null {
+  const t = url.searchParams.get("token");
+  return t && t.trim().length > 0 ? t : null;
 }
 
-// Cryptographically verify the HS256 Supabase JWT
-async function verifyJWT(token: string, secret: string): Promise<boolean> {
-  try {
-    const parts = token.split('.');
-    if (parts.length !== 3) return false;
-
-    const encoder = new TextEncoder();
-    
-    // Import the secret key
-    const key = await crypto.subtle.importKey(
-      'raw',
-      encoder.encode(secret),
-      { name: 'HMAC', hash: 'SHA-256' },
-      false,
-      ['verify']
+// Cache JWKS resolver at module scope
+let jwksCache: ReturnType<typeof createRemoteJWKSet> | null = null;
+function getJWKS(supabaseUrl: string) {
+  if (!jwksCache) {
+    jwksCache = createRemoteJWKSet(
+      new URL(`${supabaseUrl}/auth/v1/.well-known/jwks.json`)
     );
+  }
+  return jwksCache;
+}
 
-    // Convert signature from base64url to Uint8Array
-    const signatureStr = base64UrlDecode(parts[2]);
-    const signature = new Uint8Array(signatureStr.length);
-    for (let i = 0; i < signatureStr.length; i++) {
-      signature[i] = signatureStr.charCodeAt(i);
+async function verifySupabaseJWT(
+  token: string,
+  env: Env
+): Promise<VerifiedToken> {
+  const issuer = `${env.SUPABASE_URL}/auth/v1`;
+
+  // 1) Preferred path: verify via JWKS (RS256/ES256, modern setup)
+  try {
+    const JWKS = getJWKS(env.SUPABASE_URL);
+
+    const { payload } = await jwtVerify(token, JWKS, {
+      issuer,
+      audience: "authenticated", // Supabase access tokens use this audience
+    });
+
+    return { valid: true, payload };
+  } catch (e: any) {
+    // 2) Fallback path for legacy HS256 projects:
+    // Ask Supabase Auth server to validate the token directly.
+    try {
+      const res = await fetch(`${env.SUPABASE_URL}/auth/v1/user`, {
+        method: "GET",
+        headers: {
+          apikey: env.SUPABASE_PUBLISHABLE_KEY,
+          Authorization: `Bearer ${token}`,
+        },
+      });
+
+      if (!res.ok) {
+        return {
+          valid: false,
+          reason: `Auth /user validation failed (${res.status})`,
+        };
+      }
+
+      // Optional: parse user response if you want user id/email
+      // const user = await res.json();
+
+      return { valid: true };
+    } catch (fallbackErr: any) {
+      return {
+        valid: false,
+        reason: `JWT validation failed: ${e?.message || "unknown"}; fallback failed: ${fallbackErr?.message || "unknown"
+          }`,
+      };
     }
-
-    const data = encoder.encode(parts[0] + '.' + parts[1]);
-
-    // Verify cryptographic signature
-    const isValid = await crypto.subtle.verify('HMAC', key, signature, data);
-    if (!isValid) return false;
-
-    // Verify expiration
-    const payload = JSON.parse(base64UrlDecode(parts[1]));
-    if (payload.exp && Math.floor(Date.now() / 1000) > payload.exp) {
-      console.warn("Token expired");
-      return false;
-    }
-
-    return true;
-  } catch (e) {
-    console.error("JWT verification failed:", e);
-    return false;
   }
 }
 
@@ -68,11 +95,11 @@ export default {
     const id = env.CHAT_ROOM_DO.idFromName(roomId);
     const stub = env.CHAT_ROOM_DO.get(id);
     return stub.fetch(request);
-  }
+  },
 };
 
 export class ChatRoomDO extends DurableObject {
-  constructor(ctx: DurableObjectState, env: Env) {
+  constructor(ctx: DurableObjectState, readonly env: Env) {
     super(ctx, env);
   }
 
@@ -80,44 +107,31 @@ export class ChatRoomDO extends DurableObject {
     const url = new URL(request.url);
 
     if (request.method === "POST") {
-      // 1. Extract the key from the request header
       const providedKey = request.headers.get("X-DO-Access-Key");
-      
-      // 2. Compare it to the environment secret
       if (providedKey !== this.env.DO_SECRET_KEY) {
-        console.warn("Blocked unauthorized broadcast attempt");
         return new Response("Unauthorized", { status: 401 });
       }
-      
+
       const payload = await request.json();
       this.broadcastToAll(JSON.stringify(payload));
       return new Response("Broadcasted", { status: 200 });
     }
 
     const upgradeHeader = request.headers.get("Upgrade");
-    if (!upgradeHeader || upgradeHeader !== "websocket") {
+    if (!upgradeHeader || upgradeHeader.toLowerCase() !== "websocket") {
       return new Response("Expected websocket", { status: 426 });
     }
 
-    // 🔒 3. Extract and Verify the JWT from the query string
-    const token = url.searchParams.get("token");
+    const token = getBearerFromQuery(url);
     if (!token) {
-      console.warn("Missing connection token");
       return new Response("Missing authentication token", { status: 401 });
     }
 
-    if (!this.env.SUPABASE_JWT_SECRET) {
-      console.error("Missing SUPABASE_JWT_SECRET in Cloudflare environment");
-      return new Response("Server configuration error", { status: 500 });
-    }
-
-    const isTokenValid = await verifyJWT(token, this.env.SUPABASE_JWT_SECRET);
-    if (!isTokenValid) {
-      console.warn("Invalid or expired connection token");
+    const result = await verifySupabaseJWT(token, this.env);
+    if (!result.valid) {
       return new Response("Unauthorized or Expired Token", { status: 401 });
     }
 
-    // 4. Upgrade connection ONLY if token is mathematically valid
     const webSocketPair = new WebSocketPair();
     const [client, server] = Object.values(webSocketPair);
     this.ctx.acceptWebSocket(server);
@@ -125,9 +139,10 @@ export class ChatRoomDO extends DurableObject {
   }
 
   broadcastToAll(messageString: string) {
-    const allConnectedUsers = this.ctx.getWebSockets();
-    for (const connection of allConnectedUsers) {
-      try { connection.send(messageString); } catch (err) {}
+    for (const connection of this.ctx.getWebSockets()) {
+      try {
+        connection.send(messageString);
+      } catch (_) { }
     }
   }
 }
