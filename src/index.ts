@@ -12,7 +12,7 @@ export interface Env {
   SUPABASE_PUBLISHABLE_KEY: string;
 
   // Optional: legacy HS256 secret if you insist on local HS256 verify (not recommended)
-  // SUPABASE_JWT_SECRET?: string;
+  // SUPABASE_JWT_SECRET?: string; 
 }
 
 type VerifiedToken = {
