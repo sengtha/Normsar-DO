@@ -106,6 +106,7 @@ export class ChatRoomDO extends DurableObject {
   async fetch(request: Request) {
     const url = new URL(request.url);
 
+    // 1) Handle programmatic POST broadcasts from your backend
     if (request.method === "POST") {
       const providedKey = request.headers.get("X-DO-Access-Key");
       if (providedKey !== this.env.DO_SECRET_KEY) {
@@ -117,6 +118,7 @@ export class ChatRoomDO extends DurableObject {
       return new Response("Broadcasted", { status: 200 });
     }
 
+    // 2) Handle WebSocket Upgrades
     const upgradeHeader = request.headers.get("Upgrade");
     if (!upgradeHeader || upgradeHeader.toLowerCase() !== "websocket") {
       return new Response("Expected websocket", { status: 426 });
@@ -134,15 +136,58 @@ export class ChatRoomDO extends DurableObject {
 
     const webSocketPair = new WebSocketPair();
     const [client, server] = Object.values(webSocketPair);
-    this.ctx.acceptWebSocket(server);
+    
+    this.ctx.acceptWebSocket(server, ["hub-member"]);
+    
     return new Response(null, { status: 101, webSocket: client });
   }
 
-  broadcastToAll(messageString: string) {
-    for (const connection of this.ctx.getWebSockets()) {
+  // ==============================================================
+  // ⚡ HIBERNATION API: These methods wake up the DO automatically
+  // ==============================================================
+
+  async webSocketMessage(ws: WebSocket, message: string | ArrayBuffer) {
+    // 1. Security: Message Size Validation
+    // Allows ~50KB per message to accommodate encrypted E2EE payloads
+    const size = typeof message === "string" ? message.length : message.byteLength;
+    if (size > 50000) {
+      ws.close(1009, "Message payload exceeds allowed size limit");
+      return;
+    }
+
+    // 2. Broadcast: Simplified logic handles both text and binary natively
+    for (const connection of this.ctx.getWebSockets("hub-member")) {
+      if (connection !== ws) {
+        try {
+          connection.send(message);
+        } catch (_) {
+          // Ignore broken connections; DO will clean them up automatically
+        }
+      }
+    }
+  }
+
+  async webSocketClose(ws: WebSocket, code: number, reason: string, wasClean: boolean) {
+    // Broadcast user disconnect notification to all remaining members
+    this.broadcastToAll(JSON.stringify({ 
+      type: "user_left",
+      timestamp: Date.now() 
+    }));
+  }
+
+  async webSocketError(ws: WebSocket, error: any) {
+    console.error("WebSocket error:", error);
+  }
+
+  // ==============================================================
+  // Utilities
+  // ==============================================================
+
+  broadcastToAll(message: string | ArrayBuffer) {
+    for (const connection of this.ctx.getWebSockets("hub-member")) {
       try {
-        connection.send(messageString);
-      } catch (_) { }
+        connection.send(message);
+      } catch (_) {}
     }
   }
 }
