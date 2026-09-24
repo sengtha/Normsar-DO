@@ -15,8 +15,8 @@ A production-ready WebSocket server built on Cloudflare Workers' Durable Objects
 
 | Feature | Description |
 |---------|-------------|
-| **JWT Auth** | Validates Supabase access tokens (RS256/ES256 primary, HS256 fallback) |
-| **WebSocket** | Real-time bidirectional communication with persistent connections |
+| **Room Auth** | A socket opens only for an active participant of that room, checked against the project's `room_participants` with the caller's own token |
+| **WebSocket** | Real-time server-to-client delivery; frames sent by clients are ignored |
 | **Broadcasting** | Send messages to all connected clients in a room |
 | **Room-based** | Separate rooms identified by URL path (e.g., `/chat/room-123`) |
 | **Server API** | POST endpoint for sending messages with API key authentication |
@@ -175,7 +175,7 @@ curl -X POST https://api.example.com/chat/room-123 \
 
 **Connection Response**:
 - `101 Switching Protocols` - Connection established
-- `401 Unauthorized` - Invalid or missing token
+- `401 Unauthorized` - Invalid, expired or missing token, or not an active member of the room
 - `426 Upgrade Required` - Request wasn't a WebSocket upgrade
 
 **Message Format**:
@@ -220,7 +220,7 @@ Content-Type: application/json
 | Status | Meaning | Example |
 |--------|---------|---------|
 | `400` | Missing room ID | `{"error": "Missing Room ID"}` |
-| `401` | Authentication failed | `{"error": "Unauthorized or Expired Token"}` |
+| `401` | Authentication or room membership failed | `Unauthorized, expired, or not a member of this room` |
 | `426` | Not a WebSocket upgrade | `{"error": "Expected websocket"}` |
 | `500` | Server error | Internal server error |
 
@@ -229,9 +229,17 @@ Content-Type: application/json
 ## Security Considerations
 
 ### ✅ Authentication
-- All WebSocket connections require valid Supabase JWT
-- POST requests require `X-DO-Access-Key` header
-- Tokens are verified against Supabase JWKS endpoint
+- A WebSocket connection requires a Supabase token of an **active participant of that room**.
+  The DO asks the project's PostgREST (`SUPABASE_URL`) for the caller's own
+  `room_participants` row using the caller's token, so PostgREST verifies the
+  signature and expiry and RLS applies. This works for Hub tokens and for Silo
+  sessions minted by `authenticate-hub-user`.
+- For a Silo's own DO, set `SUPABASE_URL` / `SUPABASE_PUBLISHABLE_KEY` to that
+  Silo's URL and key, not the Hub's.
+- Clients only listen. Messages reach a room only through the POST endpoint
+  (the backend, after it has checked and stored them); frames sent by clients
+  are dropped so nobody can inject fake events into others' views.
+- POST requests require the `X-DO-Access-Key` header (compared in constant time).
 
 ### ✅ HTTPS Requirement
 - **Production**: API key header transmitted only over HTTPS
