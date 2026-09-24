@@ -1,89 +1,75 @@
 import { DurableObject } from "cloudflare:workers";
-import { createRemoteJWKSet, jwtVerify, JWTPayload } from "jose";
 
 export interface Env {
   CHAT_ROOM_DO: DurableObjectNamespace;
   DO_SECRET_KEY: string;
 
-  // Your Supabase project URL: https://<project-ref>.supabase.co
+  // The Supabase project whose rooms this DO serves (the Hub, or a Silo):
+  // https://<project-ref>.supabase.co
   SUPABASE_URL: string;
 
-  // Use publishable key (or legacy anon key) for /auth/v1/user fallback checks
+  // Publishable key (or legacy anon key) of that project, for PostgREST.
   SUPABASE_PUBLISHABLE_KEY: string;
-
-  // Optional: legacy HS256 secret if you insist on local HS256 verify (not recommended)
-  // SUPABASE_JWT_SECRET?: string; 
 }
-
-type VerifiedToken = {
-  valid: boolean;
-  payload?: JWTPayload;
-  reason?: string;
-};
 
 function getBearerFromQuery(url: URL): string | null {
   const t = url.searchParams.get("token");
   return t && t.trim().length > 0 ? t : null;
 }
 
-// Cache JWKS resolver at module scope
-let jwksCache: ReturnType<typeof createRemoteJWKSet> | null = null;
-function getJWKS(supabaseUrl: string) {
-  if (!jwksCache) {
-    jwksCache = createRemoteJWKSet(
-      new URL(`${supabaseUrl}/auth/v1/.well-known/jwks.json`)
-    );
+const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+function tokenSubject(token: string): string | null {
+  try {
+    const part = token.split(".")[1].replace(/-/g, "+").replace(/_/g, "/");
+    const sub = JSON.parse(atob(part)).sub;
+    return typeof sub === "string" && UUID_RE.test(sub) ? sub : null;
+  } catch {
+    return null;
   }
-  return jwksCache;
 }
 
-async function verifySupabaseJWT(
-  token: string,
-  env: Env
-): Promise<VerifiedToken> {
-  const issuer = `${env.SUPABASE_URL}/auth/v1`;
+// A socket for a room is only for that room's active participants. Checking
+// that the token was valid (as before) let any signed-in user subscribe to
+// any room, DMs included, and read its messages live.
+//
+// The check asks the project's own PostgREST with the caller's token, which
+// verifies the signature and expiry (asymmetric or HS256 alike, and Silo
+// sessions minted by authenticate-hub-user, which have no auth.users row)
+// and applies the room_participants RLS.
+async function isActiveRoomMember(token: string, roomId: string, env: Env): Promise<boolean> {
+  const sub = tokenSubject(token);
+  if (!sub || !UUID_RE.test(roomId)) return false;
 
-  // 1) Preferred path: verify via JWKS (RS256/ES256, modern setup)
+  const query = new URLSearchParams({
+    select: "room_id",
+    room_id: `eq.${roomId}`,
+    user_id: `eq.${sub}`,
+    status: "eq.active",
+    limit: "1",
+  });
   try {
-    const JWKS = getJWKS(env.SUPABASE_URL);
-
-    const { payload } = await jwtVerify(token, JWKS, {
-      issuer,
-      audience: "authenticated", // Supabase access tokens use this audience
+    const res = await fetch(`${env.SUPABASE_URL.replace(/\/+$/, "")}/rest/v1/room_participants?${query}`, {
+      headers: {
+        apikey: env.SUPABASE_PUBLISHABLE_KEY,
+        Authorization: `Bearer ${token}`,
+      },
     });
-
-    return { valid: true, payload };
-  } catch (e: any) {
-    // 2) Fallback path for legacy HS256 projects:
-    // Ask Supabase Auth server to validate the token directly.
-    try {
-      const res = await fetch(`${env.SUPABASE_URL}/auth/v1/user`, {
-        method: "GET",
-        headers: {
-          apikey: env.SUPABASE_PUBLISHABLE_KEY,
-          Authorization: `Bearer ${token}`,
-        },
-      });
-
-      if (!res.ok) {
-        return {
-          valid: false,
-          reason: `Auth /user validation failed (${res.status})`,
-        };
-      }
-
-      // Optional: parse user response if you want user id/email
-      // const user = await res.json();
-
-      return { valid: true };
-    } catch (fallbackErr: any) {
-      return {
-        valid: false,
-        reason: `JWT validation failed: ${e?.message || "unknown"}; fallback failed: ${fallbackErr?.message || "unknown"
-          }`,
-      };
-    }
+    if (!res.ok) return false;
+    const rows = await res.json();
+    return Array.isArray(rows) && rows.length > 0;
+  } catch {
+    return false;
   }
+}
+
+function timingSafeEqual(a: string, b: string): boolean {
+  const enc = new TextEncoder();
+  const x = enc.encode(a);
+  const y = enc.encode(b);
+  let diff = x.length ^ y.length;
+  for (let i = 0; i < Math.max(x.length, y.length); i++) diff |= (x[i] ?? 0) ^ (y[i] ?? 0);
+  return diff === 0;
 }
 
 export default {
@@ -108,8 +94,8 @@ export class ChatRoomDO extends DurableObject {
 
     // 1) Handle programmatic POST broadcasts from your backend
     if (request.method === "POST") {
-      const providedKey = request.headers.get("X-DO-Access-Key");
-      if (providedKey !== this.env.DO_SECRET_KEY) {
+      const providedKey = request.headers.get("X-DO-Access-Key") ?? "";
+      if (!this.env.DO_SECRET_KEY || !timingSafeEqual(providedKey, this.env.DO_SECRET_KEY)) {
         return new Response("Unauthorized", { status: 401 });
       }
 
@@ -129,9 +115,9 @@ export class ChatRoomDO extends DurableObject {
       return new Response("Missing authentication token", { status: 401 });
     }
 
-    const result = await verifySupabaseJWT(token, this.env);
-    if (!result.valid) {
-      return new Response("Unauthorized or Expired Token", { status: 401 });
+    const roomId = url.pathname.split("/")[2] ?? "";
+    if (!(await isActiveRoomMember(token, roomId, this.env))) {
+      return new Response("Unauthorized, expired, or not a member of this room", { status: 401 });
     }
 
     const webSocketPair = new WebSocketPair();
@@ -146,25 +132,12 @@ export class ChatRoomDO extends DurableObject {
   // ⚡ HIBERNATION API: These methods wake up the DO automatically
   // ==============================================================
 
-  async webSocketMessage(ws: WebSocket, message: string | ArrayBuffer) {
-    // 1. Security: Message Size Validation
-    // Allows ~50KB per message to accommodate encrypted E2EE payloads
-    const size = typeof message === "string" ? message.length : message.byteLength;
-    if (size > 50000) {
-      ws.close(1009, "Message payload exceeds allowed size limit");
-      return;
-    }
-
-    // 2. Broadcast: Simplified logic handles both text and binary natively
-    for (const connection of this.ctx.getWebSockets("hub-member")) {
-      if (connection !== ws) {
-        try {
-          connection.send(message);
-        } catch (_) {
-          // Ignore broken connections; DO will clean them up automatically
-        }
-      }
-    }
+  async webSocketMessage(_ws: WebSocket, _message: string | ArrayBuffer) {
+    // Clients only listen. Everything in a room comes from the backend's
+    // authenticated POST broadcasts (send-message, normsar-ai), which have
+    // already been checked and stored. Relaying client frames let any
+    // connected socket push fake NEW_MESSAGE / EDIT_MESSAGE / DELETE_MESSAGE
+    // events into everyone else's view, so they are ignored.
   }
 
   async webSocketClose(ws: WebSocket, code: number, reason: string, wasClean: boolean) {
